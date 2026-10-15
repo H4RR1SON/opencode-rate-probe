@@ -1,7 +1,12 @@
 {
   "name": "opencode-rate-probe",
   "private": true,
+  "type": "module",
   "scripts": {
-    "start": "bun run server.ts"
+    "build": "npx esbuild server.ts --bundle --platform=node --format=esm --outfile=dist/server.mjs --target=node20",
+    "start": "node dist/server.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
   }
 }

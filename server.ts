@@ -5,6 +5,8 @@
 // GET  /health  — liveness
 // GET  /ip      — show this service's egress IP
 
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+
 const PORT = parseInt(process.env.PORT || "10000", 10);
 const OPENCODE_API_KEY = process.env.OPENCODE_API_KEY!;
 const OPENCODE_ORG_ID = process.env.OPENCODE_ORG_ID!;
@@ -15,6 +17,8 @@ const INF_BASE = "https://opencode.ai/inference/v1";
 
 const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 let lastTs = 0, counter = 0;
+
+function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
 function mintId(prefix: string, descending: boolean): string {
   const ts = Date.now();
@@ -178,23 +182,14 @@ async function runMatrix(): Promise<any> {
   const mediumPrompt = "Explain the difference between a B-tree and a B+ tree in 3 paragraphs.";
 
   const matrix: ProbeConfig[] = [
-    // 1. Baseline — does our token work from Render's IP?
     { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "token", label: "baseline-zen-stream" },
     { model: "deepseek-v4.1-flash-free", gateway: "inference", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "token", label: "baseline-inf-stream" },
     { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: false, auth: "token", label: "baseline-zen-nostream" },
-
-    // 2. Auth variants
     { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "public", label: "auth-public" },
     { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "none", label: "auth-none" },
-
-    // 3. Different free models (check per-model isolation)
     { model: "nemotron-3.5-lightning-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "token", label: "model-nemotron" },
     { model: "deepseek-v4-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "token", label: "model-dsv4" },
-
-    // 4. Session reuse vs fresh sessions
     { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "token", sessionId: "ses_fixed_rate_test_session_01", label: "session-fixed" },
-
-    // 5. Medium prompt (more tokens consumed)
     { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: mediumPrompt, maxTokens: 512, stream: true, auth: "token", label: "medium-prompt" },
   ];
 
@@ -202,21 +197,15 @@ async function runMatrix(): Promise<any> {
   for (let i = 0; i < matrix.length; i++) {
     const r = await fireOne(matrix[i]!, i);
     phase1Results.push(r);
-    // Small delay between probes to avoid self-interference
-    await Bun.sleep(500);
+    await sleep(500);
   }
 
-  // Phase 2: Burst test — 10 rapid sequential requests (same model)
+  // Phase 2: 10 rapid sequential requests
   const burstResults: ProbeResult[] = [];
   for (let i = 0; i < 10; i++) {
     const r = await fireOne({
-      model: "deepseek-v4.1-flash-free",
-      gateway: "zen",
-      prompt: shortPrompt,
-      maxTokens: 32,
-      stream: true,
-      auth: "token",
-      label: `burst-seq-${i}`,
+      model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt,
+      maxTokens: 32, stream: true, auth: "token", label: `burst-seq-${i}`,
     }, i);
     burstResults.push(r);
   }
@@ -225,34 +214,23 @@ async function runMatrix(): Promise<any> {
   const concurrentResults = await Promise.all(
     Array.from({ length: 10 }, (_, i) =>
       fireOne({
-        model: "deepseek-v4.1-flash-free",
-        gateway: "zen",
-        prompt: shortPrompt,
-        maxTokens: 32,
-        stream: true,
-        auth: "token",
-        label: `burst-conc-${i}`,
+        model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt,
+        maxTokens: 32, stream: true, auth: "token", label: `burst-conc-${i}`,
       }, i)
     )
   );
 
-  // Phase 4: Sustained — send 1 req every 3s for 60s (20 requests)
+  // Phase 4: 20 requests at 1 req/3s
   const sustainedResults: ProbeResult[] = [];
   for (let i = 0; i < 20; i++) {
     const r = await fireOne({
-      model: "deepseek-v4.1-flash-free",
-      gateway: "zen",
-      prompt: shortPrompt,
-      maxTokens: 32,
-      stream: true,
-      auth: "token",
-      label: `sustained-${i}`,
+      model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt,
+      maxTokens: 32, stream: true, auth: "token", label: `sustained-${i}`,
     }, i);
     sustainedResults.push(r);
-    if (i < 19) await Bun.sleep(3000);
+    if (i < 19) await sleep(3000);
   }
 
-  // Compute the egress IP
   let egressIP = "unknown";
   try {
     const ipRes = await fetch("https://api.ipify.org?format=json");
@@ -276,47 +254,63 @@ async function runMatrix(): Promise<any> {
   };
 }
 
-const server = Bun.serve({
-  port: PORT,
-  async fetch(req) {
-    const url = new URL(req.url);
-    const path = url.pathname;
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    req.on("error", reject);
+  });
+}
 
+function sendJson(res: ServerResponse, status: number, data: any) {
+  const body = JSON.stringify(data);
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(body);
+}
+
+const httpServer = createServer(async (req, res) => {
+  const url = new URL(req.url || "/", `http://localhost:${PORT}`);
+  const path = url.pathname;
+
+  try {
     if (path === "/health") {
-      return Response.json({ status: "ok", port: PORT });
+      return sendJson(res, 200, { status: "ok", port: PORT });
     }
 
     if (path === "/ip") {
-      try {
-        const r = await fetch("https://api.ipify.org?format=json");
-        return new Response(await r.text(), { headers: { "content-type": "application/json" } });
-      } catch (e: any) {
-        return Response.json({ error: e.message }, { status: 500 });
-      }
+      const r = await fetch("https://api.ipify.org?format=json");
+      const txt = await r.text();
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(txt);
     }
 
-    // Auth gate
-    const key = req.headers.get("authorization")?.replace("Bearer ", "") || req.headers.get("x-probe-key");
-    if (key !== PROBE_KEY) {
-      return Response.json({ error: "unauthorized" }, { status: 401 });
+    const auth = req.headers["authorization"]?.replace("Bearer ", "") ||
+      (req.headers["x-probe-key"] as string);
+    if (auth !== PROBE_KEY) {
+      return sendJson(res, 401, { error: "unauthorized" });
     }
 
     if (path === "/probe" && req.method === "POST") {
-      const body = await req.json() as ProbeConfig & { count?: number };
+      const body = JSON.parse(await readBody(req)) as ProbeConfig & { count?: number };
       const count = body.count || 1;
       const results = await Promise.all(
         Array.from({ length: count }, (_, i) => fireOne(body, i))
       );
-      return Response.json({ results });
+      return sendJson(res, 200, { results });
     }
 
     if (path === "/matrix" && req.method === "POST") {
       const result = await runMatrix();
-      return Response.json(result);
+      return sendJson(res, 200, result);
     }
 
-    return Response.json({ error: "not found", routes: ["/health", "/ip", "/probe", "/matrix"] }, { status: 404 });
-  },
+    sendJson(res, 404, { error: "not found", routes: ["/health", "/ip", "/probe", "/matrix"] });
+  } catch (e: any) {
+    sendJson(res, 500, { error: e.message });
+  }
 });
 
-console.log(`Rate probe listening on :${PORT}`);
+httpServer.listen(PORT, () => {
+  console.log(`Rate probe listening on :${PORT}`);
+});
