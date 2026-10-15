@@ -305,7 +305,45 @@ const httpServer = createServer(async (req, res) => {
       return sendJson(res, 200, result);
     }
 
-    sendJson(res, 404, { error: "not found", routes: ["/health", "/ip", "/probe", "/matrix"] });
+    // Relay endpoint: proxy an arbitrary request to OpenCode from this node's IP
+    if (path === "/relay" && req.method === "POST") {
+      const payload = JSON.parse(await readBody(req)) as {
+        url: string;
+        headers: Record<string, string>;
+        body: any;
+      };
+
+      const upstream = await fetch(payload.url, {
+        method: "POST",
+        headers: payload.headers,
+        body: JSON.stringify(payload.body),
+        signal: AbortSignal.timeout(300_000),
+      });
+
+      if (upstream.status === 429 || upstream.status >= 400) {
+        const txt = await upstream.text();
+        res.writeHead(upstream.status, {
+          "content-type": upstream.headers.get("content-type") || "application/json",
+          ...(upstream.headers.get("retry-after") ? { "retry-after": upstream.headers.get("retry-after")! } : {}),
+        });
+        return res.end(txt);
+      }
+
+      // Stream SSE through
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      const reader = upstream.body!.getReader();
+      const dec = new TextDecoder();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(dec.decode(value, { stream: true }));
+        }
+      } catch {}
+      return res.end();
+    }
+
+    sendJson(res, 404, { error: "not found", routes: ["/health", "/ip", "/probe", "/relay", "/matrix"] });
   } catch (e: any) {
     sendJson(res, 500, { error: e.message });
   }
