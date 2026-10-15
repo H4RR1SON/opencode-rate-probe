@@ -1,0 +1,322 @@
+// Rate-limit matrix probe — runs on Render, driven via HTTP.
+//
+// POST /probe   — fire N requests and return results
+// POST /matrix  — run the full matrix test
+// GET  /health  — liveness
+// GET  /ip      — show this service's egress IP
+
+const PORT = parseInt(process.env.PORT || "10000", 10);
+const OPENCODE_API_KEY = process.env.OPENCODE_API_KEY!;
+const OPENCODE_ORG_ID = process.env.OPENCODE_ORG_ID!;
+const PROBE_KEY = process.env.PROBE_KEY || "probe-default";
+
+const ZEN_BASE = "https://opencode.ai/zen/v1";
+const INF_BASE = "https://opencode.ai/inference/v1";
+
+const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+let lastTs = 0, counter = 0;
+
+function mintId(prefix: string, descending: boolean): string {
+  const ts = Date.now();
+  if (ts !== lastTs) { lastTs = ts; counter = 0; }
+  counter++;
+  const cur = BigInt(ts) * 0x1000n + BigInt(counter);
+  const val = descending ? ~cur : cur;
+  let hex = "";
+  for (let i = 0; i < 6; i++)
+    hex += ((Number((val >> BigInt(40 - 8 * i)) & 0xffn)) & 0xff).toString(16).padStart(2, "0");
+  const rnd = new Uint8Array(14);
+  crypto.getRandomValues(rnd);
+  return prefix + "_" + hex + Array.from(rnd, (b) => ID_CHARS[b % 62]).join("");
+}
+
+function randomHex(n: number): string {
+  const buf = new Uint8Array(n);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+type ProbeResult = {
+  idx: number;
+  label: string;
+  status: number;
+  ttfbMs: number;
+  totalMs: number;
+  outputTokens: number;
+  retryAfter?: string;
+  rateLimitHeaders: Record<string, string>;
+  error?: string;
+  bodySnippet?: string;
+};
+
+type ProbeConfig = {
+  model: string;
+  gateway: "zen" | "inference";
+  prompt: string;
+  maxTokens: number;
+  stream: boolean;
+  sessionId?: string;
+  auth: "token" | "public" | "none";
+  label: string;
+};
+
+async function fireOne(cfg: ProbeConfig, idx: number): Promise<ProbeResult> {
+  const base = cfg.gateway === "zen" ? ZEN_BASE : INF_BASE;
+  const sessionId = cfg.sessionId || mintId("ses", true);
+  const tid = randomHex(16);
+  const sid = randomHex(8);
+
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    accept: "*/*",
+    "user-agent": "opencode/latest/2.0.28/cli",
+    "x-opencode-client": "cli",
+    "x-opencode-org-id": OPENCODE_ORG_ID,
+    "x-opencode-project": "rate-matrix-probe",
+    "x-opencode-session": sessionId,
+    "x-opencode-session-id": sessionId,
+    "x-session-affinity": sessionId,
+    "x-session-id": sessionId,
+    b3: `${tid}-${sid}-1`,
+    traceparent: `00-${tid}-${sid}-01`,
+  };
+
+  if (cfg.auth === "token") {
+    headers.authorization = `Bearer ${OPENCODE_API_KEY}`;
+  } else if (cfg.auth === "public") {
+    headers.authorization = "Bearer public";
+  }
+
+  const body: Record<string, any> = {
+    model: cfg.model,
+    messages: [{ role: "user", content: cfg.prompt }],
+    stream: cfg.stream,
+    tools: [
+      { type: "function", function: { name: "shell", description: "Run a shell command", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"], additionalProperties: false } } },
+      { type: "function", function: { name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false } } },
+    ],
+  };
+  if (cfg.maxTokens > 0) body.max_tokens = cfg.maxTokens;
+  if (cfg.stream) body.stream_options = { include_usage: true };
+
+  const t0 = performance.now();
+  let ttfb = 0, outputTokens = 0, status = 0;
+  let error: string | undefined;
+  let retryAfter: string | undefined;
+  let bodySnippet: string | undefined;
+  const rateLimitHeaders: Record<string, string> = {};
+
+  try {
+    const res = await fetch(`${base}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+    });
+
+    status = res.status;
+    retryAfter = res.headers.get("retry-after") ?? undefined;
+    for (const [k, v] of res.headers.entries()) {
+      if (k.startsWith("x-ratelimit") || k === "retry-after") {
+        rateLimitHeaders[k] = v;
+      }
+    }
+
+    if (status >= 400) {
+      const txt = await res.text();
+      error = txt.slice(0, 500);
+      bodySnippet = txt.slice(0, 200);
+    } else if (cfg.stream) {
+      const reader = res.body!.getReader();
+      const dec = new TextDecoder();
+      let buf = "", firstChunk = true;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (firstChunk) { ttfb = Math.round(performance.now() - t0); firstChunk = false; }
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n"); buf = lines.pop()!;
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const p = line.slice(5).trim();
+          if (!p || p === "[DONE]") continue;
+          try {
+            const j = JSON.parse(p);
+            if (j.usage) outputTokens = j.usage.completion_tokens ?? 0;
+          } catch {}
+        }
+      }
+    } else {
+      ttfb = Math.round(performance.now() - t0);
+      const txt = await res.text();
+      bodySnippet = txt.slice(0, 200);
+      try {
+        const j = JSON.parse(txt);
+        outputTokens = j.usage?.completion_tokens ?? 0;
+      } catch {}
+    }
+  } catch (e: any) {
+    error = e.message?.slice(0, 300);
+  }
+
+  return {
+    idx,
+    label: cfg.label,
+    status,
+    ttfbMs: ttfb,
+    totalMs: Math.round(performance.now() - t0),
+    outputTokens,
+    retryAfter,
+    rateLimitHeaders,
+    error,
+    bodySnippet,
+  };
+}
+
+async function runMatrix(): Promise<any> {
+  const shortPrompt = "Reply with the single word pong.";
+  const mediumPrompt = "Explain the difference between a B-tree and a B+ tree in 3 paragraphs.";
+
+  const matrix: ProbeConfig[] = [
+    // 1. Baseline — does our token work from Render's IP?
+    { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "token", label: "baseline-zen-stream" },
+    { model: "deepseek-v4.1-flash-free", gateway: "inference", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "token", label: "baseline-inf-stream" },
+    { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: false, auth: "token", label: "baseline-zen-nostream" },
+
+    // 2. Auth variants
+    { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "public", label: "auth-public" },
+    { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "none", label: "auth-none" },
+
+    // 3. Different free models (check per-model isolation)
+    { model: "nemotron-3.5-lightning-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "token", label: "model-nemotron" },
+    { model: "deepseek-v4-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "token", label: "model-dsv4" },
+
+    // 4. Session reuse vs fresh sessions
+    { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: shortPrompt, maxTokens: 32, stream: true, auth: "token", sessionId: "ses_fixed_rate_test_session_01", label: "session-fixed" },
+
+    // 5. Medium prompt (more tokens consumed)
+    { model: "deepseek-v4.1-flash-free", gateway: "zen", prompt: mediumPrompt, maxTokens: 512, stream: true, auth: "token", label: "medium-prompt" },
+  ];
+
+  const phase1Results: ProbeResult[] = [];
+  for (let i = 0; i < matrix.length; i++) {
+    const r = await fireOne(matrix[i]!, i);
+    phase1Results.push(r);
+    // Small delay between probes to avoid self-interference
+    await Bun.sleep(500);
+  }
+
+  // Phase 2: Burst test — 10 rapid sequential requests (same model)
+  const burstResults: ProbeResult[] = [];
+  for (let i = 0; i < 10; i++) {
+    const r = await fireOne({
+      model: "deepseek-v4.1-flash-free",
+      gateway: "zen",
+      prompt: shortPrompt,
+      maxTokens: 32,
+      stream: true,
+      auth: "token",
+      label: `burst-seq-${i}`,
+    }, i);
+    burstResults.push(r);
+  }
+
+  // Phase 3: 10 concurrent requests
+  const concurrentResults = await Promise.all(
+    Array.from({ length: 10 }, (_, i) =>
+      fireOne({
+        model: "deepseek-v4.1-flash-free",
+        gateway: "zen",
+        prompt: shortPrompt,
+        maxTokens: 32,
+        stream: true,
+        auth: "token",
+        label: `burst-conc-${i}`,
+      }, i)
+    )
+  );
+
+  // Phase 4: Sustained — send 1 req every 3s for 60s (20 requests)
+  const sustainedResults: ProbeResult[] = [];
+  for (let i = 0; i < 20; i++) {
+    const r = await fireOne({
+      model: "deepseek-v4.1-flash-free",
+      gateway: "zen",
+      prompt: shortPrompt,
+      maxTokens: 32,
+      stream: true,
+      auth: "token",
+      label: `sustained-${i}`,
+    }, i);
+    sustainedResults.push(r);
+    if (i < 19) await Bun.sleep(3000);
+  }
+
+  // Compute the egress IP
+  let egressIP = "unknown";
+  try {
+    const ipRes = await fetch("https://api.ipify.org?format=json");
+    const ipData = await ipRes.json() as any;
+    egressIP = ipData.ip;
+  } catch {}
+
+  return {
+    egressIP,
+    timestamp: new Date().toISOString(),
+    phase1_matrix: phase1Results,
+    phase2_burst_sequential: burstResults,
+    phase3_burst_concurrent: concurrentResults,
+    phase4_sustained: sustainedResults,
+    summary: {
+      phase1: { total: phase1Results.length, ok: phase1Results.filter(r => r.status === 200).length, rate429: phase1Results.filter(r => r.status === 429).length },
+      phase2: { total: burstResults.length, ok: burstResults.filter(r => r.status === 200).length, rate429: burstResults.filter(r => r.status === 429).length },
+      phase3: { total: concurrentResults.length, ok: concurrentResults.filter(r => r.status === 200).length, rate429: concurrentResults.filter(r => r.status === 429).length },
+      phase4: { total: sustainedResults.length, ok: sustainedResults.filter(r => r.status === 200).length, rate429: sustainedResults.filter(r => r.status === 429).length },
+    },
+  };
+}
+
+const server = Bun.serve({
+  port: PORT,
+  async fetch(req) {
+    const url = new URL(req.url);
+    const path = url.pathname;
+
+    if (path === "/health") {
+      return Response.json({ status: "ok", port: PORT });
+    }
+
+    if (path === "/ip") {
+      try {
+        const r = await fetch("https://api.ipify.org?format=json");
+        return new Response(await r.text(), { headers: { "content-type": "application/json" } });
+      } catch (e: any) {
+        return Response.json({ error: e.message }, { status: 500 });
+      }
+    }
+
+    // Auth gate
+    const key = req.headers.get("authorization")?.replace("Bearer ", "") || req.headers.get("x-probe-key");
+    if (key !== PROBE_KEY) {
+      return Response.json({ error: "unauthorized" }, { status: 401 });
+    }
+
+    if (path === "/probe" && req.method === "POST") {
+      const body = await req.json() as ProbeConfig & { count?: number };
+      const count = body.count || 1;
+      const results = await Promise.all(
+        Array.from({ length: count }, (_, i) => fireOne(body, i))
+      );
+      return Response.json({ results });
+    }
+
+    if (path === "/matrix" && req.method === "POST") {
+      const result = await runMatrix();
+      return Response.json(result);
+    }
+
+    return Response.json({ error: "not found", routes: ["/health", "/ip", "/probe", "/matrix"] }, { status: 404 });
+  },
+});
+
+console.log(`Rate probe listening on :${PORT}`);
